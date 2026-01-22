@@ -118,20 +118,28 @@ FactorioStatus() {
   if screen -list | grep -q "factorio"; then
     local world_name=$(basename "$factorio_world" .zip)
     local world_size=$(du -h "$factorio_world" 2>/dev/null | cut -f1)
-    local pid=$(pgrep -f "$factorio.*--start-server" | head -1)
+    local pid=$(pgrep -f "^/.*/factorio.*--start-server" | head -1)
     local uptime=$(ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ')
+    local cpu_raw=$(ps -o %cpu= -p "$pid" 2>/dev/null | tr -d ' ')
+    local cpu_cores=$(nproc)
+    local cpu_usage=$(echo "$cpu_raw $cpu_cores" | awk '{printf "%.1f", $1/$2}')
+    local mem_usage=$(ps -o rss= -p "$pid" 2>/dev/null | numfmt --to=iec --from-unit=1024)
     # Check for online players
-    # Send /players command to server and capture response
-    local log_size_before=$(wc -l < "$factorio_log")
+    # Send /players command to server and capture console output
+    local screen_output="/tmp/factorio-screen-$$.txt"
     screen -S factorio -X stuff "/players online$(printf '\r')"
     sleep 0.5
-    local new_entries=$(tail -n +$((log_size_before + 1)) "$factorio_log")
-    local player_list=$(echo "$new_entries" | grep "^ " | grep -v "Online players" | wc -l)
+    screen -S factorio -X hardcopy "$screen_output"
+    local player_count=$(grep -oP 'Online players \(\K\d+(?=\))' "$screen_output" 2>/dev/null | tail -1)
+    [ -z "$player_count" ] && player_count="0"
+    rm -f "$screen_output"
     # Print the status
     echo "  World:   $world_name ($world_size)"
-    echo "  Process: $pid"
+    echo "  Online:  $player_count players"
+    echo "  Process: $pid Running"
     echo "  Uptime:  $uptime"
-    echo "  Online:  $player_list players"
+    echo "  CPU:     ${cpu_usage}%"
+    echo "  Memory:  $mem_usage"
     return 0
   else
     echo "  Factorio server is not running"

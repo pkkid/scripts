@@ -135,7 +135,7 @@ HytaleStatus() {
     # Print the status
     echo "  World:   $world_name ($world_size)"
     echo "  Online:  $player_count players"
-    echo "  Process: $pid"
+    echo "  Process: $pid Running"
     echo "  Uptime:  $uptime"
     echo "  CPU:     ${cpu_usage}%"
     echo "  Memory:  $mem_usage"
