@@ -21,7 +21,7 @@
 
 update_dir="$HOME/Sources"
 working_dir="$HOME/Sources/hytale/Server"
-backup_dir="/media/Synology/Michael/Backup/Hytale"
+backup_dir="/media/Synology/Michael/Backup/hytale"
 hytale_universe="$working_dir/universe"
 
 hytale_port=25566

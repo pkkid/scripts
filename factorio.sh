@@ -23,8 +23,8 @@
 update_dir="$HOME/Sources"
 working_dir="$HOME/Sources/factorio"
 steam_dir="$HOME/.factorio"
-backup_dir="/media/Synology/Michael/Backup/Factorio"
-factorio_world="$working_dir/saves/PKsWaterWorldMK2.zip"
+backup_dir="/media/Synology/Michael/Backup/factorio"
+factorio_world="$working_dir/saves/PKsLakeWorld.zip"
 
 factorio="$working_dir/bin/x64/factorio"
 factorio_log="$working_dir/factorio-current.log"
@@ -52,7 +52,7 @@ FactorioStart() {
   fi
   rm -f "$factorio_log"
   echo "  Starting Factorio server"
-  screen -dmS factorio $factorio --start-server "$factorio_world" --console-log "$factorio_log"
+  screen -dmS factorio $factorio --start-server "$factorio_world" --console-log "$factorio_log" --server-settings "$working_dir/server-settings.json"
   local elapsed=0 timeout=30
   while [ $elapsed -lt $timeout ]; do
     if [ -f "$factorio_log" ]; then
