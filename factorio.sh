@@ -24,7 +24,7 @@ update_dir="$HOME/Sources"
 working_dir="$HOME/Sources/factorio"
 steam_dir="$HOME/.factorio"
 backup_dir="/media/Synology/Michael/Backup/factorio"
-factorio_world="$working_dir/saves/PKsLakeWorld.zip"
+factorio_world="$working_dir/saves/JohnnysFirstSpaceAge.zip"
 
 factorio="$working_dir/bin/x64/factorio"
 factorio_log="$working_dir/factorio-current.log"
