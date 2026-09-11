@@ -56,7 +56,7 @@ def find_projects(rootdirs):
                     repodir = os.path.join(rootdir, dirname)
                     print(f'Found git project {repodir}')
                     repodirs.append(repodir)
-        except Exception:
+        except Exception:  # noqa
             pass
     return repodirs
 
