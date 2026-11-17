@@ -1,0 +1,977 @@
+#!/usr/bin/env python3
+"""
+gitr: git recursive. Report on the git repos directly inside the given
+folders (default: the current folder), one row per repo with its branch, how
+far it is from upstream, and counts of local branches, extra worktrees,
+stashes and dirty files. It does not look any deeper than one level. Run
+inside a repo (or any folder in it), every command works on just that repo.
+
+Usage: gitr [COMMAND] [ARGS...]
+
+Commands:
+  ll [-q] [--prs] [--remote] [FOLDER...]
+                        list repos with their status (the default command);
+                        --prs adds open GitHub pull request counts;
+                        --remote fetches and shows the origin side instead
+  pull [-q] [FOLDER...] fetch each repo and fast-forward every local branch
+                        that is behind its upstream
+  clean [-n] [-y] [--remote] [FOLDER...]
+                        delete branches (and their clean worktrees) whose
+                        work is already merged; shows the list and asks first;
+                        --remote deletes merged branches on GitHub instead
+
+Examples:
+  gitr                  same as gitr ll
+  gitr ll ~/Projects ~/Sources
+  gitr -q               only repos with extra branches, worktrees,
+                        stashes, dirty files or unpushed commits
+  gitr pull             update all branches in every repo here
+  gitr ll -h            help for one command
+"""
+import argparse, json, os, re, subprocess, sys
+
+LEGEND = """\
+Status flags in [ ] after the branch name (gitr ll):
+  *   changes not staged yet
+  +   staged changes
+  $   at least one stash
+  ?   untracked files
+  ↑   commits not pushed (branch name purple)
+  ↓   remote has commits to pull (branch name yellow)
+  ⇕   diverged: both of the above (branch name red)
+  ∅   no remote branch to compare with (branch name white)
+  []  clean and in sync (branch name green)
+"""
+from concurrent.futures import ThreadPoolExecutor
+
+
+def is_repo(folder):
+    """ True for a repo's main checkout. Linked worktrees (a .git file that
+    points into another repo's .git/worktrees) are skipped, since they are
+    counted under their repo's Worktrees column. """
+    dotgit = os.path.join(folder, '.git')
+    if os.path.isdir(dotgit):
+        return True
+    try:
+        with open(dotgit) as f:
+            return '/worktrees/' not in f.read()
+    except OSError:
+        return False
+
+
+def find_repos(folder):
+    """ The repo `folder` is in (its top level, even from a subfolder or a
+    worktree), or else each repo directly inside `folder`. """
+    folder = os.path.abspath(os.path.expanduser(folder))
+    top = subprocess.run(['git', '-C', folder, 'rev-parse', '--show-toplevel'], capture_output=True, text=True)
+    if top.returncode == 0 and top.stdout.strip():
+        yield top.stdout.strip()
+        return
+    try:
+        entries = sorted(os.scandir(folder), key=lambda e: e.name)
+    except OSError:
+        return
+    for entry in entries:
+        if entry.is_dir() and is_repo(entry.path):
+            yield entry.path
+
+
+def git(path, *args):
+    result = subprocess.run(['git', '-C', path, *args], capture_output=True, text=True)
+    return result.stdout if result.returncode == 0 else ''
+
+
+def lines(text):
+    return [x for x in text.splitlines() if x.strip()]
+
+
+def add_common_args(parser):
+    parser.add_argument('paths', nargs='*', default=['.'], help='folders to look in (default: .)')
+    parser.add_argument('--color', choices=['auto', 'always', 'never'], default='auto',
+        help='colour the output (default: auto, only in a terminal)')
+
+
+def all_repos(paths):
+    repos = sorted({r for p in paths for r in find_repos(p)})
+    if not repos:
+        sys.exit('gitr: no git repos found')
+    return repos
+
+
+# How strong dim text is: 0 is the background colour, 1 the normal text
+# colour. Terminals draw their own dim style at about 0.5.
+DIM_STRENGTH = 0.35
+
+
+def terminal_colors():
+    """ Ask the terminal for its text and background colours (OSC 10 and
+    11). Returns ((r, g, b), (r, g, b)) as 0-255, or None if it does not
+    answer within a moment. """
+    try:
+        import select, termios, tty
+        fd = os.open('/dev/tty', os.O_RDWR | os.O_NOCTTY)
+    except (ImportError, OSError):
+        return None
+    try:
+        saved = termios.tcgetattr(fd)
+        tty.setraw(fd)
+        os.write(fd, b'\033]10;?\033\\\033]11;?\033\\')
+        reply = b''
+        while reply.count(b'rgb:') < 2 or not reply.endswith((b'\007', b'\033\\')):
+            if not select.select([fd], [], [], 0.1)[0]:
+                break
+            reply += os.read(fd, 1024)
+    except (OSError, termios.error):
+        return None
+    finally:
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        except (NameError, termios.error):
+            pass
+        os.close(fd)
+    found = re.findall(rb'\](1[01]);rgb:([0-9a-fA-F]+)/([0-9a-fA-F]+)/([0-9a-fA-F]+)', reply)
+    colors = {}
+    for which, *parts in found:
+        colors[which] = tuple(int(x, 16) * 255 // (16 ** len(x) - 1) for x in parts)
+    return (colors[b'10'], colors[b'11']) if b'10' in colors and b'11' in colors else None
+
+
+def dim_code():
+    """ An exact colour DIM_STRENGTH of the way from the background to the
+    text colour, or the terminal's own dim style if it will not say. """
+    colors = terminal_colors()
+    if not colors:
+        return '2'
+    fg, bg = colors
+    r, g, b = (round(b_ + (f - b_) * DIM_STRENGTH) for f, b_ in zip(fg, bg))
+    return f'38;2;{r};{g};{b}'
+
+
+def make_paint(choice):
+    """ Return paint(text, ansi_code), a no-op when colour is off. The code
+    'dim' means faded text, see dim_code(). """
+    if choice == 'auto':
+        color = sys.stdout.isatty() and not os.environ.get('NO_COLOR')
+    else:
+        color = choice == 'always'
+    dim = dim_code() if color else ''
+    def paint(text, code):
+        code = dim if code == 'dim' else code
+        return f'\033[{code}m{text}\033[0m' if color and code else text
+    return paint
+
+
+def repo_info(path):
+    """ Gather one repo's status. One `git status` call covers the branch,
+    upstream, ahead/behind and the staged, unstaged and untracked files. """
+    r = {'path': path, 'branch': '', 'upstream': False, 'ahead': 0, 'behind': 0,
+         'staged': False, 'unstaged': False, 'untracked': False, 'dirty': 0}
+    oid = ''
+    for line in git(path, 'status', '--porcelain=v2', '--branch').splitlines():
+        if line.startswith('# branch.head '):
+            r['branch'] = line.split(' ', 2)[2]
+        elif line.startswith('# branch.oid '):
+            oid = line.split()[2][:7]
+        elif line.startswith('# branch.upstream '):
+            r['upstream'] = True
+        elif line.startswith('# branch.ab '):
+            ahead, behind = line.split()[2:4]
+            r['ahead'], r['behind'] = int(ahead), abs(int(behind))
+        elif line.startswith(('1 ', '2 ', 'u ')):
+            r['dirty'] += 1
+            xy = line.split()[1]
+            r['staged'] |= xy[0] != '.'
+            r['unstaged'] |= xy[1] != '.'
+        elif line.startswith('? '):
+            r['dirty'] += 1
+            r['untracked'] = True
+    if r['branch'] == '(detached)':
+        r['branch'] = f'({oid})'
+    r['branches'] = len(lines(git(path, 'branch', '--format=%(refname)')))
+    r['worktrees'] = len([x for x in lines(git(path, 'worktree', 'list', '--porcelain')) if x.startswith('worktree ')]) - 1
+    r['stashes'] = len(lines(git(path, 'stash', 'list')))
+    # How long ago the last commit was, and its message on one line, at most
+    # 40 characters plus an ellipsis.
+    when, _, message = git(path, 'log', '-1', '--format=%cr%x00%B').partition('\0')
+    message = ' '.join(message.split())
+    message = message if len(message) <= 40 else message[:40].rstrip() + '…'
+    r['message'], r['when'] = message, when.strip()
+    r['added'] = r['removed'] = 0
+    if r['dirty']:
+        # Lines added and removed in tracked files, staged or not, against the
+        # last commit. Binary files (shown as "-") are left out.
+        for line in lines(git(path, 'diff', 'HEAD', '--numstat')):
+            added, removed = line.split('\t')[:2]
+            if added.isdigit() and removed.isdigit():
+                r['added'] += int(added)
+                r['removed'] += int(removed)
+    return r
+
+
+def sync_state(r):
+    """ Like gita: no upstream, in sync, ahead, behind or diverged. """
+    if not r['upstream']:
+        return 'none'
+    if r['ahead'] and r['behind']:
+        return 'diverged'
+    return 'ahead' if r['ahead'] else 'behind' if r['behind'] else 'synced'
+
+
+# Sync state: (symbol, branch colour) using gita's colours.
+SYNC_STYLE = {
+    'synced': ('', '32'),     # green
+    'ahead': ('↑', '35'),     # purple: local commits not pushed
+    'behind': ('↓', '33'),    # yellow: remote has commits to pull
+    'diverged': ('⇕', '31'),  # red: both
+    'none': ('∅', '37'),      # white: no upstream branch
+}
+
+
+def status_flags(r):
+    """ gita's [*+$?↑] flags: unstaged, staged, stashed, untracked, sync. """
+    return ''.join((
+        '*' if r['unstaged'] else '',
+        '+' if r['staged'] else '',
+        '$' if r['stashes'] else '',
+        '?' if r['untracked'] else '',
+        SYNC_STYLE[sync_state(r)][0],
+    ))
+
+
+def sync_text(r):
+    """ Commits ahead of (↑, not pushed) and behind (↓, not pulled) upstream. """
+    return ' '.join(x for x in (f"↑{r['ahead']}" if r['ahead'] else '', f"↓{r['behind']}" if r['behind'] else '') if x)
+
+
+# Colour per status flag: changes red, staged green, stash purple, untracked
+# cyan, and the sync symbols in their sync colour.
+FLAG_COLORS = {'*': '31', '+': '32', '$': '35', '?': '36', '↑': '35', '↓': '33', '⇕': '31', '∅': '37'}
+
+
+def paint_flags(flag, width, paint):
+    """ Colour each symbol inside [..] on its own. """
+    inner = ''.join(paint(ch, FLAG_COLORS.get(ch, '')) for ch in flag[1:-1])
+    return '[' + inner + ']' + ' ' * (width - len(flag))
+
+
+def change_text(r):
+    """ Lines added (+) and removed (-) in uncommitted changes. """
+    return ' '.join(x for x in (f"+{r['added']}" if r['added'] else '', f"-{r['removed']}" if r['removed'] else '') if x)
+
+
+# Count columns whose zeros are drawn dim (see DIM_STRENGTH), so the
+# non-zero ones stand out. Brnch is dim at 1, since every repo has one.
+DIM_ZEROS = {'worktrees', 'stashes', 'dirty'}
+
+
+def count_color(key, value, hot, code):
+    if value is not None and hot(value):
+        return code
+    if key in DIM_ZEROS and value == 0 or key == 'branches' and value == 1:
+        return 'dim'
+    return ''
+
+
+def needs_attention(r):
+    return r['branches'] > 1 or r['worktrees'] > 0 or r['stashes'] or r['dirty'] or r['ahead'] or r.get('prs')
+
+
+def github_slug(path):
+    """ owner/name of the repo's origin on GitHub, or None. Matches ssh host
+    aliases like github.com-work as well as https URLs. """
+    url = git(path, 'remote', 'get-url', 'origin').strip()
+    m = re.search(r'github\.com[^:/]*[:/]([^/]+)/([^/]+?)(?:\.git)?/?$', url)
+    return f'{m[1]}/{m[2]}' if m else None
+
+
+def gh_accounts():
+    """ gh's logged-in github.com accounts, the active one first. Read from
+    gh's hosts.yml, which is instant, instead of `gh auth status`, which
+    checks every token over the network. """
+    config = os.environ.get('GH_CONFIG_DIR') or os.path.join(
+        os.environ.get('XDG_CONFIG_HOME') or os.path.expanduser('~/.config'), 'gh')
+    users, active, host, section = [], None, None, None
+    try:
+        with open(os.path.join(config, 'hosts.yml')) as f:
+            for line in f:
+                indent, text = len(line) - len(line.lstrip()), line.strip()
+                if not text or text.startswith('#'):
+                    continue
+                if indent == 0:
+                    host, section = text.rstrip(':'), None
+                elif host == 'github.com' and indent == 4:
+                    key, _, value = text.partition(':')
+                    section = key
+                    if key == 'user':
+                        active = value.strip()
+                elif host == 'github.com' and section == 'users' and indent == 8:
+                    users.append(text.split(':')[0])
+    except OSError:
+        return []
+    return sorted(users, key=lambda u: u != active)
+
+
+def github_as(account, selections):
+    """ One GraphQL request as one gh account: for each owner/name in
+    `selections`, ask for its selection set inside repository { ... }.
+    Returns {slug: data} for the repos that account can see. """
+    token = subprocess.run(['gh', 'auth', 'token', '--user', account], capture_output=True, text=True).stdout.strip()
+    if not token:
+        return {}
+    slugs = sorted(selections)
+    fields = ' '.join(
+        f'r{i}: repository(owner: {json.dumps(slug.split("/")[0])}, name: {json.dumps(slug.split("/")[1])})'
+        f' {{ {selections[slug]} }}' for i, slug in enumerate(slugs))
+    out = subprocess.run(['gh', 'api', 'graphql', '-f', f'query={{ {fields} }}'],
+        capture_output=True, text=True, env=dict(os.environ, GH_TOKEN=token))
+    try:
+        data = json.loads(out.stdout).get('data') or {}
+    except ValueError:
+        return {}  # offline or similar
+    return {slug: data[f'r{i}'] for i, slug in enumerate(slugs) if data.get(f'r{i}')}
+
+
+ACCOUNT_CACHE = os.path.join(os.environ.get('XDG_CACHE_HOME') or os.path.expanduser('~/.cache'), 'gitr', 'accounts.json')
+
+
+def github(selections, chunk=None):
+    """ Ask GitHub about many repos with as few requests as possible. Each repo
+    goes to one gh account: the one that answered for its owner last time
+    (remembered in ACCOUNT_CACHE), else the active account first and the
+    next account only for repos the first could not see. `chunk` splits each
+    account's repos into requests of that many, for heavy selections that
+    would otherwise hit GitHub's time limit. """
+    if not selections:
+        return {}
+    try:
+        accounts = gh_accounts()
+    except OSError:
+        return {}  # gh is not installed
+    try:
+        with open(ACCOUNT_CACHE) as f:
+            owners = json.load(f)
+    except (OSError, ValueError):
+        owners = {}
+    owner = lambda slug: slug.split('/')[0].lower()
+    results, todo = {}, set(selections)
+    while todo and accounts:
+        # Known owners go straight to their account, all accounts at once.
+        batches = {}
+        for slug in todo:
+            account = owners.get(owner(slug))
+            account = account if account in accounts else accounts[0]
+            batches.setdefault(account, {})[slug] = selections[slug]
+        jobs = []
+        for account, batch in batches.items():
+            slugs = sorted(batch)
+            size = chunk or len(slugs)
+            jobs += [(account, {x: batch[x] for x in slugs[i:i + size]}) for i in range(0, len(slugs), size)]
+        with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+            answers = list(zip((a for a, _ in jobs), pool.map(lambda job: github_as(*job), jobs)))
+        for account, found in answers:
+            results.update(found)
+            for slug in found:
+                owners[owner(slug)] = account
+        missed = todo - set(results)
+        # Retry what an account could not see with the accounts not yet tried.
+        tried = set(batches)
+        accounts = [a for a in accounts if a not in tried]
+        for slug in missed:
+            owners.pop(owner(slug), None)
+        todo = missed
+    try:
+        os.makedirs(os.path.dirname(ACCOUNT_CACHE), exist_ok=True)
+        with open(ACCOUNT_CACHE, 'w') as f:
+            json.dump(owners, f, indent=1, sort_keys=True)
+    except OSError:
+        pass
+    return results
+
+
+def open_pr_counts(slugs):
+    """ Open PR count per owner/name. """
+    data = github({slug: 'pullRequests(states: OPEN) { totalCount }' for slug in set(slugs)})
+    return {slug: repo['pullRequests']['totalCount'] for slug, repo in data.items()}
+
+
+def fetch_repo(path):
+    """ git fetch --all --prune, never asking for a password. Returns an
+    error message or None. """
+    result = subprocess.run(['git', '-C', path, 'fetch', '--all', '--prune', '--quiet'],
+        capture_output=True, text=True, env=pull_env(path))
+    return first_error(result) if result.returncode else None
+
+
+def remote_info(path, error, default):
+    """ The origin side of one repo, from its just-fetched remote branches.
+    `default` is GitHub's default branch name when known, since origin/HEAD
+    is only set at clone time and can be stale. Merged counts branches git
+    can see are merged into the default branch; squash merges are left to
+    `gitr clean`, which checks each branch but is slower. """
+    r = {'path': path, 'error': error, 'default': None, 'branches': None, 'merged': None, 'when': '', 'message': ''}
+    if not git(path, 'remote', 'get-url', 'origin').strip():
+        r['error'] = 'no origin remote'
+        return r
+    if default and git(path, 'rev-parse', '--verify', '--quiet', f'refs/remotes/origin/{default}').strip():
+        base = f'refs/remotes/origin/{default}'
+    else:
+        base, default = default_base(path)
+        if base and not base.startswith('refs/remotes/'):
+            base = None  # only a local main: nothing on origin to compare with
+    refs = [x for x in lines(git(path, 'for-each-ref', '--format=%(refname)', 'refs/remotes/origin')) if x != 'refs/remotes/origin/HEAD']
+    r['branches'] = len(refs)
+    if not base:
+        return r
+    r['default'] = default
+    # One git command lists every remote branch already merged into base.
+    merged = {x.strip().removeprefix('origin/') for x in lines(git(path, 'branch', '-r', '--merged', base))
+              if x.strip().startswith('origin/') and ' -> ' not in x}
+    r['merged'] = len(merged - {default})
+    when, _, message = git(path, 'log', '-1', '--format=%cr%x00%B', base).partition('\0')
+    message = ' '.join(message.split())
+    r['message'] = message if len(message) <= 40 else message[:40].rstrip() + '…'
+    r['when'] = when.strip()
+    return r
+
+
+def ll_remote(repos, opts):
+    """ gitr ll --remote: fetch every repo and ask GitHub at the same time,
+    then report the origin side. """
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        slugs = dict(zip(repos, pool.map(github_slug, repos)))
+        hub = pool.submit(github, {slug: 'defaultBranchRef { name } hasIssuesEnabled'
+            ' pullRequests(states: OPEN) { totalCount } issues(states: OPEN) { totalCount }'
+            for slug in set(slugs.values()) if slug})
+        errors = list(pool.map(fetch_repo, repos))
+        hub = hub.result()
+        data = [hub.get(slugs[path]) or {} for path in repos]
+        defaults = [(d.get('defaultBranchRef') or {}).get('name') for d in data]
+        rows = list(pool.map(remote_info, repos, errors, defaults))
+    for r in rows:
+        data = hub.get(slugs[r['path']])
+        r['prs'] = data['pullRequests']['totalCount'] if data else None
+        r['issues'] = data['issues']['totalCount'] if data and data['hasIssuesEnabled'] else None
+    if any(slugs.values()) and not hub:
+        print('gitr: could not reach GitHub (offline, or gh not logged in?)', file=sys.stderr)
+    if opts.quiet:
+        rows = [r for r in rows if r['error'] or r['merged'] or r['prs']]
+        if not rows:
+            return print('All clean.')
+
+    paint = make_paint(opts.color)
+    show = lambda n: '-' if n is None else n
+    names = [os.path.basename(r['path']) for r in rows]
+    namew = max(len(n) for n in names)
+    defaultw = max([7] + [len(r['default'] or '-') for r in rows])
+    # Count columns: (header, key, colour when worth a look, dim when).
+    counts = [
+        ('Brnch', 'branches', lambda n: False, '', lambda n: n == 1),
+        ('PRs', 'prs', lambda n: n > 0, '35', lambda n: n == 0),      # purple: open PRs
+        ('Merged', 'merged', lambda n: n > 0, '33', lambda n: n == 0), # yellow: merged branches to delete
+        ('Issues', 'issues', lambda n: n > 0, '36', lambda n: n == 0), # cyan: open issues
+    ]
+    widths = [max(5, len(h), *(len(str(show(r[k]))) for r in rows)) for h, k, _, _, _ in counts]
+    whenw = max([11] + [len(r['when']) for r in rows])
+    header = f"{'Repo':<{namew}}  {'Default':<{defaultw}}  "
+    header += ' '.join(f'{h:>{w}}' for (h, _, _, _, _), w in zip(counts, widths))
+    header += f"  {'Last Commit':<{whenw}}  Last Commit Msg"
+    print(paint(header, '1'))
+    for name, r in zip(names, rows):
+        repo = paint(f'{name:<{namew}}', '1;34' if r['error'] or r['merged'] or r['prs'] else '34')
+        cells = []
+        for (_, k, hot, code, dim), w in zip(counts, widths):
+            n = r[k]
+            color = '' if n is None else code if hot(n) else 'dim' if dim(n) else ''
+            cells.append(paint(f'{show(n):>{w}}', color))
+        tail = paint(r['error'], '31') if r['error'] else f"{r['when'] or '-':<{whenw}}  {r['message']}"
+        print(f"{repo}  {r['default'] or '-':<{defaultw}}  {' '.join(cells)}  {tail}".rstrip())
+
+
+def cmd_ll(args):
+    """ List the repos with their branch, sync state and cleanup counts. """
+    parser = argparse.ArgumentParser(prog='gitr ll', description=cmd_ll.__doc__.strip(),
+        epilog=LEGEND, formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_common_args(parser)
+    parser.add_argument('-q', '--quiet', action='store_true', help='only show repos with something to look at')
+    parser.add_argument('--prs', action='store_true', help='add a column of open GitHub pull requests (one network request)')
+    parser.add_argument('--remote', action='store_true',
+        help='show the remote side instead: fetches, then lists branches, open PRs, merged branches and issues')
+    opts = parser.parse_args(args)
+
+    repos = all_repos(opts.paths)
+    if opts.remote:
+        return ll_remote(repos, opts)
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        slugs = dict(zip(repos, pool.map(github_slug, repos))) if opts.prs else {}
+        prs = pool.submit(open_pr_counts, [x for x in slugs.values() if x]) if opts.prs else None
+        rows = list(pool.map(repo_info, repos))
+        prs = prs.result() if prs else {}
+    for r in rows:
+        # None: not on GitHub, or GitHub could not be asked.
+        r['prs'] = prs.get(slugs.get(r['path'])) if opts.prs else None
+    if opts.prs and any(slugs.values()) and not prs:
+        print('gitr: could not get pull requests from GitHub (offline, or gh not logged in?)', file=sys.stderr)
+    if opts.quiet:
+        rows = [r for r in rows if needs_attention(r)]
+        if not rows:
+            return print('All clean.')
+
+    paint = make_paint(opts.color)
+    names = [os.path.basename(r['path']) for r in rows]
+    namew = max(len(n) for n in names)
+    branchw = min(max(len(r['branch']) for r in rows), 32)
+    flags = [f'[{status_flags(r)}]' for r in rows]
+    flagw = max(len(f) for f in flags)
+    syncs = [sync_text(r) or '-' for r in rows]
+    syncw = max([4] + [len(x) for x in syncs])
+    # Count columns: (header, key, highlight when, colour). Each is 5 wide.
+    counts = [
+        ('Brnch', 'branches', lambda n: n > 1, '33'),  # yellow: extra branches
+        ('Trees', 'worktrees', lambda n: n > 0, '36'), # cyan: extra worktrees
+        ('Stash', 'stashes', lambda n: n > 0, '35'),   # purple: stashes
+        ('Files', 'dirty', lambda n: n > 0, '31'),     # red: changed files
+    ]
+    if opts.prs:
+        counts.append(('PRs', 'prs', lambda n: n > 0, '35'))  # purple: open PRs
+    widths = [max(5, *(len(str(r[k])) for r in rows)) for h, k, _, _ in counts]
+    show = lambda n: '-' if n is None else n
+    header = f"{'Repo':<{namew}}  {'Branch':<{branchw + 1 + flagw}}  {'Sync':<{syncw}}  "
+    diffw = max([4] + [len(change_text(r)) for r in rows])
+    whenw = max([11] + [len(r['when']) for r in rows])
+    header += ' '.join(f'{h:>{w}}' for (h, _, _, _), w in zip(counts, widths))
+    header += f"  {'Diff':<{diffw}}  {'Last Commit':<{whenw}}  Last Commit Msg"
+    print(paint(header, '1'))
+    for name, flag, sync, r in zip(names, flags, syncs, rows):
+        branch = r['branch'] if len(r['branch']) <= branchw else r['branch'][:branchw - 1] + '…'
+        sync_color = SYNC_STYLE[sync_state(r)][1]
+        # Repo names in bold blue when something needs a look, plain blue otherwise.
+        repo = paint(f'{name:<{namew}}', '1;34' if needs_attention(r) else '34')
+        status = paint(f'{branch:<{branchw}}', sync_color) + ' ' + paint_flags(flag, flagw, paint)
+        ahead = paint(f"↑{r['ahead']}", '35') if r['ahead'] else ''
+        behind = paint(f"↓{r['behind']}", '33') if r['behind'] else ''
+        sync_cell = (' '.join(x for x in (ahead, behind) if x) or paint('-', 'dim')) + ' ' * (syncw - len(sync))
+        nums = ' '.join(paint(f'{show(r[k]):>{w}}', count_color(k, r[k], hot, code)) for (_, k, hot, code), w in zip(counts, widths))
+        added = paint(f"+{r['added']}", '32') if r['added'] else ''
+        removed = paint(f"-{r['removed']}", '31') if r['removed'] else ''
+        change_cell = ' '.join(x for x in (added, removed) if x) + ' ' * (diffw - len(change_text(r)))
+        print(f"{repo}  {status}  {sync_cell}  {nums}  {change_cell}  {r['when'] or '-':<{whenw}}  {r['message']}".rstrip())
+
+
+def pull_env(path):
+    """ Never stop to ask for a password: a repo that needs one fails instead
+    of hanging the parallel run. """
+    env = dict(os.environ, GIT_TERMINAL_PROMPT='0')
+    if 'GIT_SSH_COMMAND' not in env and not git(path, 'config', 'core.sshCommand').strip():
+        env['GIT_SSH_COMMAND'] = 'ssh -o BatchMode=yes'
+    return env
+
+
+def first_error(result):
+    msg = lines(result.stderr) or lines(result.stdout) or ['unknown error']
+    return msg[0].removeprefix('error: ').removeprefix('fatal: ')
+
+
+def pull_repo(path):
+    """ Fetch, then fast-forward every local branch that is only behind its
+    upstream. Branches checked out in a worktree are merged there with
+    --ff-only so the files update too; the rest just move their ref. """
+    env = pull_env(path)
+    run = lambda *a, cwd=path: subprocess.run(['git', '-C', cwd, *a], capture_output=True, text=True, env=env)
+    fetched = run('fetch', '--all', '--prune', '--quiet')
+    if fetched.returncode:
+        return {'path': path, 'error': 'fetch failed: ' + first_error(fetched), 'items': []}
+    checked_out, wt = {}, None
+    for line in lines(git(path, 'worktree', 'list', '--porcelain')):
+        if line.startswith('worktree '):
+            wt = line[9:]
+        elif line.startswith('branch refs/heads/'):
+            checked_out[line[18:]] = wt
+    items = []
+    fmt = '%(refname:short)%00%(objectname)%00%(upstream)%00%(upstream:track,nobracket)'
+    for line in lines(git(path, 'for-each-ref', 'refs/heads', f'--format={fmt}')):
+        branch, oid, upstream, track = line.split('\0')
+        if not upstream:
+            continue
+        if track == 'gone':
+            items.append(('gone', branch, 'upstream gone'))
+            continue
+        counts = dict(part.split() for part in track.split(', ') if part)
+        ahead, behind = int(counts.get('ahead', 0)), int(counts.get('behind', 0))
+        if not behind:
+            continue
+        if ahead:
+            items.append(('diverged', branch, f'↑{ahead} ↓{behind} diverged (skipped)'))
+            continue
+        if branch in checked_out:
+            result = run('merge', '--ff-only', '--quiet', upstream, cwd=checked_out[branch])
+        else:
+            result = run('update-ref', f'refs/heads/{branch}', upstream, oid)
+        if result.returncode:
+            error = first_error(result)
+            if 'would be overwritten' in error:
+                error = 'local changes in the way (skipped)'
+            items.append(('failed', branch, error))
+        else:
+            items.append(('pulled', branch, f'↓{behind}'))
+    return {'path': path, 'error': None, 'items': items}
+
+
+PULL_COLORS = {'pulled': '32', 'diverged': '33', 'gone': '33', 'failed': '31'}
+
+
+def cmd_pull(args):
+    """ Fetch every repo, then fast-forward each local branch that is behind
+    its upstream. Diverged branches are skipped, never merged or rebased. """
+    parser = argparse.ArgumentParser(prog='gitr pull', description=' '.join(cmd_pull.__doc__.split()))
+    add_common_args(parser)
+    parser.add_argument('-q', '--quiet', action='store_true', help='hide repos that were already up to date')
+    opts = parser.parse_args(args)
+
+    repos = all_repos(opts.paths)
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        results = list(pool.map(pull_repo, repos))
+    paint = make_paint(opts.color)
+    namew = max(len(os.path.basename(r['path'])) for r in results)
+    shown = 0
+    for r in results:
+        if opts.quiet and not r['error'] and not r['items']:
+            continue
+        name = os.path.basename(r['path'])
+        if r['error']:
+            detail = paint(r['error'], '31')
+        elif not r['items']:
+            detail = 'up to date'
+        else:
+            detail = '  '.join(paint(f'{branch} {text}', PULL_COLORS[kind]) for kind, branch, text in r['items'])
+        print(f"{paint(f'{name:<{namew}}', '34')}  {detail}")
+        shown += 1
+    if not shown:
+        print('Everything was already up to date.')
+    if any(r['error'] or any(kind == 'failed' for kind, _, _ in r['items']) for r in results):
+        sys.exit(1)
+
+
+def default_base(path):
+    """ The ref branches get merged into: the remote's default branch
+    (origin/HEAD) when known, else a local main or master. Returns
+    (ref, local branch name) or (None, None). """
+    head = git(path, 'symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD').strip()
+    if head:
+        return head, head.removeprefix('refs/remotes/origin/')
+    for name in ('main', 'master'):
+        for ref in (f'refs/remotes/origin/{name}', f'refs/heads/{name}'):
+            if git(path, 'rev-parse', '--verify', '--quiet', ref).strip():
+                return ref, name
+    return None, None
+
+
+def squash_merged(path, base, branch):
+    """ True if the branch's combined changes already landed in base as one
+    commit (a squash or rebase merge). Builds a throwaway commit holding the
+    whole branch diff and asks `git cherry` whether base has the same patch. """
+    mb = git(path, 'merge-base', base, branch).strip()
+    if not mb:
+        return False
+    if not git(path, 'diff', '--name-only', mb, branch).strip():
+        return True  # no changes of its own
+    tree = git(path, 'rev-parse', f'{branch}^{{tree}}').strip()
+    # The commit is never stored on a branch, so give it a fixed identity
+    # rather than depend on user.name and user.email being set.
+    commit = git(path, '-c', 'user.name=gitr', '-c', 'user.email=gitr@localhost',
+        'commit-tree', tree, '-p', mb, '-m', 'gitr squash check').strip()
+    return bool(commit) and git(path, 'cherry', base, commit).startswith('-')
+
+
+def contained_elsewhere(path, branch, upstream):
+    """ A remote branch, other than this branch's own upstream, that holds
+    every commit on this branch, or None. Only remote branches count: two
+    local branches on the same commit would otherwise vouch for each other
+    and both get deleted. """
+    skip = {upstream, 'refs/remotes/origin/HEAD'}
+    for ref in lines(git(path, 'for-each-ref', '--contains', f'refs/heads/{branch}', '--format=%(refname)', 'refs/remotes')):
+        if ref not in skip:
+            return ref.removeprefix('refs/remotes/')
+    return None
+
+
+def plan_clean(path, contained):
+    """ Work out what is safe to delete in one repo. Fetches first so the
+    default branch and pruned remote branches are current. """
+    env = pull_env(path)
+    fetched = subprocess.run(['git', '-C', path, 'fetch', '--all', '--prune', '--quiet'], capture_output=True, text=True, env=env)
+    plan = {'path': path, 'warning': None, 'branches': [], 'prune': [], 'slug': github_slug(path), 'candidates': []}
+    if fetched.returncode:
+        plan['warning'] = 'fetch failed, using what was fetched last: ' + first_error(fetched)
+    base, default = default_base(path)
+    if not base:
+        plan['warning'] = 'no main or master branch to compare with, skipped'
+        return plan
+    # Worktrees: the first is the main checkout, never touched.
+    worktrees, wt = [], {}
+    for line in git(path, 'worktree', 'list', '--porcelain').splitlines() + ['']:
+        if not line:
+            if wt:
+                worktrees.append(wt)
+            wt = {}
+        elif ' ' in line:
+            key, value = line.split(' ', 1)
+            wt[key] = value
+        else:
+            wt[line] = True
+    main_branch = worktrees[0].get('branch', '').removeprefix('refs/heads/') if worktrees else ''
+    # Worktrees whose folder is gone ("prunable") are cleared by the prune
+    # step instead, so their branches are treated as not checked out.
+    checked_out = {w['branch'].removeprefix('refs/heads/'): w for w in worktrees[1:] if 'branch' in w and 'prunable' not in w}
+    stale = subprocess.run(['git', '-C', path, 'worktree', 'prune', '--dry-run', '--verbose'], capture_output=True, text=True)
+    plan['prune'] = [x.removeprefix('Removing ') for x in lines(stale.stdout + stale.stderr)]
+    fmt = '%(refname:short)%00%(objectname)%00%(upstream)'
+    for line in lines(git(path, 'for-each-ref', 'refs/heads', f'--format={fmt}')):
+        branch, oid, upstream = line.split('\0')
+        if branch in (default, main_branch):
+            continue
+        worktree = checked_out.get(branch)
+        if worktree and (worktree.get('locked') or git(worktree['worktree'], 'status', '--porcelain').strip()):
+            continue  # someone's work in progress
+        if subprocess.run(['git', '-C', path, 'merge-base', '--is-ancestor', branch, base]).returncode == 0:
+            reason = 'merged'
+        elif squash_merged(path, base, branch):
+            reason = 'squash merged'
+        elif contained and (holder := contained_elsewhere(path, branch, upstream)):
+            reason = f'in {holder}'
+        else:
+            plan['candidates'].append((branch, oid, worktree))
+            continue
+        plan['branches'].append({'branch': branch, 'oid': oid, 'reason': reason, 'worktree': worktree and worktree['worktree']})
+    return plan
+
+
+def check_merged_prs(plans):
+    """ For branches the local checks could not settle, ask GitHub for a
+    merged pull request from that branch. It counts only if the PR merged
+    exactly this commit, so a branch with newer work is kept. """
+    selections, asked = {}, {}
+    for plan in plans:
+        if plan['slug'] and plan['candidates']:
+            asked[plan['slug']] = plan['candidates']
+            selections[plan['slug']] = ' '.join(
+                f'b{j}: pullRequests(headRefName: {json.dumps(branch)}, states: MERGED, last: 5) {{ nodes {{ number headRefOid }} }}'
+                for j, (branch, _, _) in enumerate(plan['candidates']))
+    data = github(selections)
+    for plan in plans:
+        repo = data.get(plan['slug']) if plan['slug'] in asked else None
+        if not repo:
+            continue
+        for j, (branch, oid, worktree) in enumerate(plan['candidates']):
+            prs = [pr for pr in (repo.get(f'b{j}') or {}).get('nodes', []) if pr['headRefOid'] == oid]
+            if prs:
+                plan['branches'].append({'branch': branch, 'oid': oid, 'reason': f"PR #{prs[-1]['number']} merged",
+                    'worktree': worktree and worktree['worktree']})
+        plan['branches'].sort(key=lambda b: b['branch'])
+
+
+def run_clean(plan):
+    """ Remove the planned worktrees and branches. Returns error lines. """
+    errors = []
+    if plan['prune']:
+        subprocess.run(['git', '-C', plan['path'], 'worktree', 'prune'], capture_output=True)
+    for item in plan['branches']:
+        if item['worktree']:
+            result = subprocess.run(['git', '-C', plan['path'], 'worktree', 'remove', item['worktree']], capture_output=True, text=True)
+            if result.returncode:
+                errors.append(f"{item['branch']}: could not remove worktree: {first_error(result)}")
+                continue
+        result = subprocess.run(['git', '-C', plan['path'], 'branch', '-D', item['branch']], capture_output=True, text=True)
+        if result.returncode:
+            errors.append(f"{item['branch']}: {first_error(result)}")
+    return errors
+
+
+# What clean --remote asks GitHub about each repo. Open PRs protect their
+# branches; merged PRs whose branch still points at the merged commit catch
+# squash merges that git cannot see.
+REMOTE_CLEAN_QUERY = (
+    'defaultBranchRef { name }'
+    ' open: pullRequests(states: OPEN, first: 100) { totalCount nodes { headRefName baseRefName isCrossRepository } }'
+    ' merged: pullRequests(states: MERGED, last: 100) { nodes { number headRefName headRefOid isCrossRepository headRef { id } } }')
+
+
+def plan_clean_remote(path, hub, anyone):
+    """ Work out which branches on origin are safe to delete. """
+    plan = {'path': path, 'warning': None, 'branches': [], 'others': 0}
+    error = fetch_repo(path)
+    if error:
+        plan['warning'] = f'fetch failed, skipped: {error}'
+        return plan
+    if not hub:
+        plan['warning'] = 'not on GitHub, or GitHub could not be reached; skipped'
+        return plan
+    default = (hub.get('defaultBranchRef') or {}).get('name')
+    base = f'refs/remotes/origin/{default}'
+    if not default or not git(path, 'rev-parse', '--verify', '--quiet', base).strip():
+        plan['warning'] = 'default branch not found on origin; skipped'
+        return plan
+    if hub['open']['totalCount'] > len(hub['open']['nodes']):
+        plan['warning'] = 'more than 100 open PRs, so cannot rule out their branches; skipped'
+        return plan
+    # Branches an open PR comes from or merges into: deleting either closes it.
+    protected = {default}
+    for pr in hub['open']['nodes']:
+        protected.add(pr['baseRefName'])
+        if not pr['isCrossRepository']:
+            protected.add(pr['headRefName'])
+    prs = {pr['headRefName']: pr for pr in hub['merged']['nodes'] if pr['headRef'] and not pr['isCrossRepository']}
+    merged = {x.strip().removeprefix('origin/') for x in lines(git(path, 'branch', '-r', '--merged', base))
+              if x.strip().startswith('origin/') and ' -> ' not in x}
+    me = git(path, 'config', 'user.email').strip().lower()
+    fmt = '%(refname:lstrip=3)%00%(objectname)%00%(authoremail:trim)%00%(committerdate:relative)'
+    for line in lines(git(path, 'for-each-ref', f'--format={fmt}', 'refs/remotes/origin')):
+        branch, oid, email, when = line.split('\0')
+        if branch == 'HEAD' or branch in protected:
+            continue
+        if branch in merged:
+            reason = 'merged'
+        elif branch in prs and prs[branch]['headRefOid'] == oid:
+            reason = f"PR #{prs[branch]['number']} merged"
+        else:
+            continue
+        if not anyone and email.lower() != me:
+            plan['others'] += 1
+            continue
+        plan['branches'].append({'branch': branch, 'oid': oid, 'reason': reason, 'when': when})
+    return plan
+
+
+def clean_remote(repos, opts):
+    """ gitr clean --remote: delete merged branches on origin, after the user
+    types yes. """
+    if opts.yes:
+        sys.exit('gitr: --yes is not allowed with --remote; deleting branches on GitHub always asks')
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        slugs = dict(zip(repos, pool.map(github_slug, repos)))
+        hub = github({slug: REMOTE_CLEAN_QUERY for slug in set(slugs.values()) if slug}, chunk=4)
+        plans = list(pool.map(lambda path: plan_clean_remote(path, hub.get(slugs[path]), opts.anyone), repos))
+    paint = make_paint(opts.color)
+    total = others = 0
+    for plan in plans:
+        name = paint(os.path.basename(plan['path']), '34')
+        if plan['warning']:
+            print(f"{name}  {paint(plan['warning'], '33')}")
+            continue
+        others += plan['others']
+        if not plan['branches']:
+            continue
+        print(f"{name}  {paint(slugs[plan['path']], '')}")
+        width = max(len(item['branch']) for item in plan['branches'])
+        for item in plan['branches']:
+            print(f"  {item['branch']:<{width}}  {paint(item['reason'], '32')}  {item['oid'][:7]}  {item['when']}")
+            total += 1
+    if others:
+        print(f"\n{others} more merged branch{'es' if others != 1 else ''} by other people were left alone (--anyone to include them).")
+    if not total:
+        return print('Nothing to clean on GitHub.')
+    nrepos = sum(1 for plan in plans if plan['branches'])
+    summary = f"{total} branch{'es' if total != 1 else ''} on GitHub in {nrepos} repo{'s' if nrepos != 1 else ''}"
+    if opts.dry_run:
+        return print(f'\nWould delete {summary}.')
+    if not sys.stdin.isatty():
+        sys.exit(f'\ngitr: would delete {summary}; this needs a terminal to confirm')
+    print(paint(f'\nThis deletes {summary}. Open PRs are not affected.', '1'))
+    if input("Type 'yes' to delete them: ").strip().lower() != 'yes':
+        return print('Nothing deleted.')
+    failed = 0
+    for plan in plans:
+        if not plan['branches']:
+            continue
+        names = [item['branch'] for item in plan['branches']]
+        result = subprocess.run(['git', '-C', plan['path'], 'push', '--quiet', 'origin', '--delete', *names],
+            capture_output=True, text=True, env=pull_env(plan['path']))
+        if result.returncode:
+            failed += 1
+            print(paint(f"{os.path.basename(plan['path'])}: {first_error(result)}", '31'))
+    print('Done, with the errors above.' if failed else f'Deleted {summary}.')
+    print('To restore one: git push origin <commit>:refs/heads/<name> (commits are listed above).')
+    if failed:
+        sys.exit(1)
+
+
+def cmd_clean(args):
+    """ Delete local branches whose work is already in the default branch
+    (merged, squash merged, or a merged GitHub PR), and the clean worktrees
+    that have them checked out. Shows the list and asks first. Never touches
+    the default branch, the main checkout's branch, worktrees with
+    uncommitted changes, or anything on GitHub. """
+    parser = argparse.ArgumentParser(prog='gitr clean', description=' '.join(cmd_clean.__doc__.split()))
+    add_common_args(parser)
+    parser.add_argument('-n', '--dry-run', action='store_true', help='only show what would be deleted')
+    parser.add_argument('-y', '--yes', action='store_true', help='delete without asking')
+    parser.add_argument('--contained', action='store_true',
+        help='also delete branches whose commits are all on another remote branch')
+    parser.add_argument('--offline', action='store_true', help='skip the GitHub merged-PR check')
+    parser.add_argument('--remote', action='store_true',
+        help='delete merged branches on GitHub instead of local ones; always asks you to type yes')
+    parser.add_argument('--anyone', action='store_true',
+        help='with --remote, include branches whose last commit is by someone else')
+    opts = parser.parse_args(args)
+
+    repos = all_repos(opts.paths)
+    if opts.remote:
+        return clean_remote(repos, opts)
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        plans = list(pool.map(lambda path: plan_clean(path, opts.contained), repos))
+    if not opts.offline:
+        check_merged_prs(plans)
+    paint = make_paint(opts.color)
+    home = os.path.expanduser('~')
+    nbranches = nworktrees = 0
+    for plan in plans:
+        if plan['warning']:
+            print(f"{paint(os.path.basename(plan['path']), '34')}  {paint(plan['warning'], '33')}")
+        if not plan['branches'] and not plan['prune']:
+            continue
+        if not plan['warning']:
+            print(paint(os.path.basename(plan['path']), '34'))
+        width = max([0] + [len(item['branch']) for item in plan['branches']])
+        for item in plan['branches']:
+            extra = ''
+            if item['worktree']:
+                extra = '  + worktree ' + item['worktree'].replace(home, '~', 1)
+                nworktrees += 1
+            print(f"  {item['branch']:<{width}}  {paint(item['reason'], '32')}  {item['oid'][:7]}{extra}")
+            nbranches += 1
+        for line in plan['prune']:
+            print(f"  {paint('stale worktree entry', '33')}  {line}")
+    if not nbranches and not any(plan['prune'] for plan in plans):
+        return print('Nothing to clean.')
+    summary = f'{nbranches} branch' + ('es' if nbranches != 1 else '') + (f', {nworktrees} worktree' + ('s' if nworktrees != 1 else '') if nworktrees else '')
+    if opts.dry_run:
+        return print(f'\nWould delete {summary}.')
+    if not opts.yes:
+        if not sys.stdin.isatty():
+            sys.exit(f'\ngitr: would delete {summary}; run with --yes to do it without a terminal')
+        if input(f'\nDelete {summary}? [y/N] ').strip().lower() not in ('y', 'yes'):
+            return print('Nothing deleted.')
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        errors = [e for plan, errs in zip(plans, pool.map(run_clean, plans)) for e in
+                  (f"{os.path.basename(plan['path'])}: {x}" for x in errs)]
+    for error in errors:
+        print(paint(error, '31'))
+    print(f'Deleted {summary}.' if not errors else 'Done, with the errors above.')
+    print('To restore a branch: git branch <name> <commit> (commits are listed above).')
+    if errors:
+        sys.exit(1)
+
+
+COMMANDS = {'ll': cmd_ll, 'pull': cmd_pull, 'clean': cmd_clean}
+
+
+def main():
+    args = sys.argv[1:]
+    if args and args[0] in ('-h', '--help'):
+        print(__doc__.strip() + '\n\n' + LEGEND.rstrip())
+        return
+    command = args.pop(0) if args and args[0] in COMMANDS else 'll'
+    COMMANDS[command](args)
+
+
+if __name__ == '__main__':
+    main()
