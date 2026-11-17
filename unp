@@ -1,0 +1,330 @@
+#!/usr/bin/env bash
+# Extract many common archive formats through one command.
+
+set -o pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: unp [OPTIONS] ARCHIVE...
+
+Extract one or more archives. By default, files are unpacked in the current
+directory. When atool is installed, unp also avoids scattering archives that
+contain several top-level files.
+
+Options:
+  -d, --directory DIR  extract into DIR
+  -D, --subdir         always create a subdirectory for each archive
+  -f, --force          allow existing files to be overwritten
+  -l, --list           list archive contents without extracting
+  -h, --help           show this help
+
+Fedora packages:
+  sudo dnf install atool 7zip unzip zstd
+
+Examples:
+  unp photos.zip source.tar.xz
+  unp -d /tmp/recovery backup.tar.zst
+  unp --list package.rpm
+EOF
+}
+
+error() {
+  printf 'unp: %s\n' "$*" >&2
+}
+
+need_command() {
+  local command_name=$1
+  local package_name=${2:-$1}
+
+  if command -v "$command_name" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  error "'$command_name' is required; on Fedora, run: sudo dnf install $package_name"
+  return 127
+}
+
+is_tar_archive() {
+  case ${1,,} in
+    *.tar | *.tar.gz | *.tgz | *.tar.bz | *.tbz | *.tar.bz2 | *.tbz2 | \
+      *.tar.xz | *.txz | *.tar.zst | *.tzst | *.tar.lz | *.tlz | \
+      *.tar.lzma | *.tar.z | *.taz)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+is_stream() {
+  case ${1,,} in
+    *.gz | *.gzip | *.bz | *.bz2 | *.bzip2 | *.xz | *.lzma | *.zst | *.zstd | *.lz | *.z)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+is_atool_archive() {
+  case ${1,,} in
+    *.tar | *.tar.gz | *.tgz | *.tar.bz | *.tbz | *.tar.bz2 | *.tbz2 | \
+      *.tar.z | *.tz | *.tar.lzo | *.tzo | *.tar.lz | *.tlz | \
+      *.tar.xz | *.txz | *.tar.7z | *.t7z | *.zip | *.jar | *.war | \
+      *.rar | *.lha | *.lzh | *.7z | *.alz | *.ace | *.a | *.arj | \
+      *.arc | *.rpm | *.deb | *.cab | *.gz | *.gzip | *.bz | *.bz2 | \
+      *.bzip2 | *.z | *.lzma | *.lzo | *.lz | *.xz | *.rz | *.lrz | *.cpio)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+stream_output_name() {
+  local name=${1##*/}
+
+  case ${name,,} in
+    *.gzip) printf '%s\n' "${name%?????}" ;;
+    *.bzip2) printf '%s\n' "${name%??????}" ;;
+    *.zstd) printf '%s\n' "${name%?????}" ;;
+    *.lzma) printf '%s\n' "${name%?????}" ;;
+    *.bz2 | *.zst) printf '%s\n' "${name%????}" ;;
+    *.gz | *.bz | *.xz | *.lz) printf '%s\n' "${name%???}" ;;
+    *.z) printf '%s\n' "${name%??}" ;;
+    *) printf '%s.out\n' "$name" ;;
+  esac
+}
+
+archive_stem() {
+  local name=${1##*/}
+  local lower=${name,,}
+  local suffix
+
+  for suffix in .tar.gz .tar.bz2 .tar.bz .tar.xz .tar.zst .tar.lzma .tar.lz .tar.z .tgz .tbz2 .tbz .txz .tzst .tlz .taz .zip .zipx .7z .rar .cab .cpio .rpm .deb .arj .lha .lzh .iso; do
+    if [[ $lower == *"$suffix" ]]; then
+      printf '%s\n' "${name:0:${#name}-${#suffix}}"
+      return
+    fi
+  done
+
+  stream_output_name "$name"
+}
+
+list_archive() {
+  local archive=$1
+  local lower=${archive,,}
+
+  if is_tar_archive "$archive"; then
+    need_command tar || return
+    tar -tf "$archive"
+  elif [[ $lower == *.zst || $lower == *.zstd ]]; then
+    need_command zstd || return
+    zstd --list "$archive"
+  elif command -v als >/dev/null 2>&1 && is_atool_archive "$archive"; then
+    als -- "$archive"
+  elif command -v 7z >/dev/null 2>&1; then
+    7z l -- "$archive"
+  elif command -v unzip >/dev/null 2>&1 && [[ $lower == *.zip ]]; then
+    unzip -l -- "$archive"
+  else
+    error "cannot list '$archive'; install atool or 7zip"
+    return 127
+  fi
+}
+
+extract_stream() {
+  local archive=$1
+  local destination=$2
+  local lower=${archive,,}
+  local output="$destination/$(stream_output_name "$archive")"
+  local decompressor
+  local package
+
+  if [[ -e $output && $force == false ]]; then
+    error "'$output' already exists (use --force to overwrite it)"
+    return 1
+  fi
+
+  case $lower in
+    *.gz | *.gzip | *.z)
+      decompressor=gzip
+      package=gzip
+      ;;
+    *.bz | *.bz2 | *.bzip2)
+      decompressor=bzip2
+      package=bzip2
+      ;;
+    *.xz | *.lzma)
+      decompressor=xz
+      package=xz
+      ;;
+    *.zst | *.zstd)
+      decompressor=zstd
+      package=zstd
+      ;;
+    *.lz)
+      decompressor=lzip
+      package=lzip
+      ;;
+  esac
+
+  need_command "$decompressor" "$package" || return
+  printf 'Extracting %s -> %s\n' "${archive##*/}" "$output"
+  "$decompressor" -dc -- "$archive" >"$output"
+}
+
+extract_with_fallback() {
+  local archive=$1
+  local destination=$2
+  local lower=${archive,,}
+  local -a overwrite_option
+
+  if is_tar_archive "$archive"; then
+    need_command tar || return
+    overwrite_option=()
+    if [[ $force == false ]]; then
+      overwrite_option=(--keep-old-files)
+    fi
+    tar "${overwrite_option[@]}" -xf "$archive" -C "$destination"
+  elif is_stream "$archive"; then
+    extract_stream "$archive" "$destination"
+  elif command -v 7z >/dev/null 2>&1; then
+    if [[ $force == true ]]; then
+      overwrite_option=(-aoa)
+    else
+      overwrite_option=(-aos)
+    fi
+    7z x "${overwrite_option[@]}" "-o$destination" -- "$archive"
+  elif command -v unzip >/dev/null 2>&1 && [[ $lower == *.zip ]]; then
+    if [[ $force == true ]]; then
+      overwrite_option=(-o)
+    else
+      overwrite_option=(-n)
+    fi
+    unzip "${overwrite_option[@]}" -- "$archive" -d "$destination"
+  else
+    error "cannot extract '$archive'; install atool or 7zip"
+    return 127
+  fi
+}
+
+extract_archive() {
+  local archive=$1
+  local destination=$2
+  local lower=${archive,,}
+  local -a atool_options=()
+
+  # atool 0.39 does not know zstd, but GNU tar and zstd do.
+  if [[ $lower == *.zst || $lower == *.zstd || $lower == *.tzst ]]; then
+    extract_with_fallback "$archive" "$destination"
+    return
+  fi
+
+  if command -v aunpack >/dev/null 2>&1 && is_atool_archive "$archive"; then
+    [[ $force == true ]] && atool_options+=(-f)
+    [[ $subdir == true ]] && atool_options+=(-D)
+    (
+      cd -- "$destination" || exit
+      aunpack "${atool_options[@]}" -- "$archive"
+    )
+    return
+  fi
+
+  if [[ $subdir == true ]]; then
+    destination="$destination/$(archive_stem "$archive")"
+    mkdir -p -- "$destination" || return
+  fi
+  extract_with_fallback "$archive" "$destination"
+}
+
+destination=.
+force=false
+list=false
+subdir=false
+archives=()
+
+while (($#)); do
+  case $1 in
+    -d | --directory)
+      if (($# < 2)); then
+        error "$1 requires a directory"
+        exit 2
+      fi
+      destination=$2
+      shift 2
+      ;;
+    --directory=*)
+      destination=${1#*=}
+      shift
+      ;;
+    -D | --subdir)
+      subdir=true
+      shift
+      ;;
+    -f | --force)
+      force=true
+      shift
+      ;;
+    -l | --list)
+      list=true
+      shift
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      archives+=("$@")
+      break
+      ;;
+    -*)
+      error "unknown option: $1"
+      usage >&2
+      exit 2
+      ;;
+    *)
+      archives+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if ((${#archives[@]} == 0)); then
+  usage >&2
+  exit 2
+fi
+
+if [[ $list == false ]]; then
+  if ! mkdir -p -- "$destination"; then
+    error "could not create destination '$destination'"
+    exit 1
+  fi
+  destination=$(realpath -- "$destination") || exit
+fi
+
+status=0
+for archive in "${archives[@]}"; do
+  if [[ ! -f $archive ]]; then
+    error "archive not found: $archive"
+    status=1
+    continue
+  fi
+
+  archive=$(realpath -- "$archive") || {
+    status=1
+    continue
+  }
+
+  if [[ $list == true ]]; then
+    list_archive "$archive" || status=1
+  else
+    extract_archive "$archive" "$destination" || status=1
+  fi
+done
+
+exit "$status"
