@@ -19,6 +19,11 @@ Commands:
                         delete branches (and their clean worktrees) whose
                         work is already merged; shows the list and asks first;
                         --remote deletes merged branches on GitHub instead
+  branch [--remote] [--default] [FOLDER...]
+                        list each repo's branches (other than main) with
+                        their sync state, merged status and last commit;
+                        --remote fetches and lists the branches on origin
+                        with their open PRs; --default includes main too
 
 Examples:
   gitr                  same as gitr ll
@@ -654,9 +659,11 @@ def cmd_pull(args):
 def default_base(path):
     """ The ref branches get merged into: the remote's default branch
     (origin/HEAD) when known, else a local main or master. Returns
-    (ref, local branch name) or (None, None). """
+    (ref, local branch name) or (None, None). origin/HEAD is only set at
+    clone time, so it is skipped when the branch it names is gone (the
+    default was renamed, say master to main). """
     head = git(path, 'symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD').strip()
-    if head:
+    if head and git(path, 'rev-parse', '--verify', '--quiet', head).strip():
         return head, head.removeprefix('refs/remotes/origin/')
     for name in ('main', 'master'):
         for ref in (f'refs/remotes/origin/{name}', f'refs/heads/{name}'):
@@ -961,7 +968,147 @@ def cmd_clean(args):
         sys.exit(1)
 
 
-COMMANDS = {'ll': cmd_ll, 'pull': cmd_pull, 'clean': cmd_clean}
+def short_message(message):
+    message = ' '.join(message.split())
+    return message if len(message) <= 40 else message[:40].rstrip() + '…'
+
+
+def list_local_branches(path):
+    """ Every local branch with its upstream state, whether it is merged into
+    the default branch, its last commit and the worktree it is checked out
+    in. Uses only what was fetched last, so it is quick. """
+    base, default = default_base(path)
+    merged = set(lines(git(path, 'branch', '--merged', base, '--format=%(refname:short)'))) if base else set()
+    head = git(path, 'symbolic-ref', '--quiet', '--short', 'HEAD').strip()
+    checked_out, wt = {}, None
+    for line in lines(git(path, 'worktree', 'list', '--porcelain')):
+        if line.startswith('worktree '):
+            wt = line[9:]
+        elif line.startswith('branch refs/heads/') and wt != path:
+            checked_out[line[18:]] = wt
+    fmt = '%(refname:short)%00%(objectname)%00%(upstream)%00%(upstream:track,nobracket)%00%(committerdate:relative)%00%(contents:subject)'
+    branches = []
+    for line in lines(git(path, 'for-each-ref', 'refs/heads', f'--format={fmt}')):
+        branch, oid, upstream, track, when, subject = line.split('\0')
+        counts = dict(part.split() for part in track.split(', ') if part and part != 'gone')
+        ahead, behind = int(counts.get('ahead', 0)), int(counts.get('behind', 0))
+        if not upstream:
+            state, sync = 'none', 'no upstream'
+        elif track == 'gone':
+            state, sync = 'none', 'upstream gone'
+        else:
+            state = sync_state({'upstream': True, 'ahead': ahead, 'behind': behind})
+            sync = ' '.join(x for x in (f'↑{ahead}' if ahead else '', f'↓{behind}' if behind else '') if x) or 'in sync'
+        tag = 'default' if branch == default else 'merged' if branch in merged else ''
+        branches.append({'branch': branch, 'oid': oid, 'current': branch == head, 'state': state, 'sync': sync,
+            'tag': tag, 'when': when, 'message': short_message(subject), 'worktree': checked_out.get(branch)})
+    return {'path': path, 'error': None, 'slug': None, 'branches': branches}
+
+
+def list_remote_branches(path, hub):
+    """ Every branch on origin, after a fetch, with whether it is merged into
+    the default branch, its open PR and its last commit. """
+    error = fetch_repo(path)
+    result = {'path': path, 'error': None, 'slug': github_slug(path), 'branches': []}
+    if not git(path, 'remote', 'get-url', 'origin').strip():
+        result['error'] = 'no origin remote'
+        return result
+    if error:
+        result['error'] = f'fetch failed, using what was fetched last: {error}'
+    default = ((hub or {}).get('defaultBranchRef') or {}).get('name')
+    if not default or not git(path, 'rev-parse', '--verify', '--quiet', f'refs/remotes/origin/{default}').strip():
+        base, default = default_base(path)
+        base = base if base and base.startswith('refs/remotes/') else None
+    else:
+        base = f'refs/remotes/origin/{default}'
+    merged = {x.strip().removeprefix('origin/') for x in lines(git(path, 'branch', '-r', '--merged', base))
+              if x.strip().startswith('origin/') and ' -> ' not in x} if base else set()
+    prs = {}
+    for pr in ((hub or {}).get('open') or {}).get('nodes', []):
+        if not pr['isCrossRepository']:
+            prs.setdefault(pr['headRefName'], []).append(pr['number'])
+    fmt = '%(refname:lstrip=3)%00%(objectname)%00%(committerdate:relative)%00%(authorname)%00%(contents:subject)'
+    for line in lines(git(path, 'for-each-ref', f'--format={fmt}', 'refs/remotes/origin')):
+        branch, oid, when, author, subject = line.split('\0')
+        if branch == 'HEAD':
+            continue
+        tag = 'default' if branch == default else 'merged' if branch in merged else ''
+        pr = ' '.join(f'#{n}' for n in sorted(prs.get(branch, [])))
+        result['branches'].append({'branch': branch, 'oid': oid, 'current': False, 'state': None, 'sync': pr,
+            'tag': tag, 'when': when, 'author': author, 'message': short_message(subject), 'worktree': None})
+    return result
+
+
+BRANCH_TAG_COLORS = {'default': '1', 'merged': '32'}
+
+
+def cmd_branch(args):
+    """ List the branches in each repo: how far each is from its upstream,
+    whether it is merged into the default branch, its last commit, and the
+    worktree it is checked out in. With --remote, fetch and list the
+    branches on origin with their open pull requests instead. Merged here
+    means a plain merge; `gitr clean -n` also finds squash merges. """
+    parser = argparse.ArgumentParser(prog='gitr branch', description=' '.join(cmd_branch.__doc__.split()))
+    add_common_args(parser)
+    parser.add_argument('--remote', action='store_true',
+        help='fetch, then list the branches on origin with their open PRs')
+    parser.add_argument('--default', action='store_true', help='include the default branch (main or master)')
+    opts = parser.parse_args(args)
+
+    repos = all_repos(opts.paths)
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        if opts.remote:
+            slugs = dict(zip(repos, pool.map(github_slug, repos)))
+            hub = github({slug: 'defaultBranchRef { name } open: pullRequests(states: OPEN, first: 100)'
+                ' { nodes { number headRefName isCrossRepository } }' for slug in set(slugs.values()) if slug})
+            if any(slugs.values()) and not hub:
+                print('gitr: could not reach GitHub (offline, or gh not logged in?)', file=sys.stderr)
+            results = list(pool.map(lambda path: list_remote_branches(path, hub.get(slugs[path])), repos))
+        else:
+            results = list(pool.map(list_local_branches, repos))
+    paint = make_paint(opts.color)
+    home = os.path.expanduser('~')
+    if not opts.default:
+        for res in results:
+            res['branches'] = [b for b in res['branches'] if b['tag'] != 'default']
+    for res in results:
+        name = paint(os.path.basename(res['path']), '34')
+        if res['error'] and not res['branches']:
+            print(f"{name}  {paint(res['error'], '33')}")
+            continue
+        if not res['branches']:
+            continue
+        heading = name + (f"  {res['slug']}" if opts.remote and res['slug'] else '')
+        print(heading + (f"  {paint(res['error'], '33')}" if res['error'] else ''))
+        rows = res['branches']
+        branchw = max(len(b['branch']) for b in rows)
+        syncw = max(len(b['sync']) for b in rows)
+        tagw = max(len(b['tag']) for b in rows)
+        whenw = max(len(b['when']) for b in rows)
+        authorw = max([0] + [len(b.get('author', '')) for b in rows])
+        for b in rows:
+            mark = paint('*', '32') if b['current'] else ' '
+            color = SYNC_STYLE[b['state']][1] if b['state'] else ''
+            sync_color = '' if opts.remote else color if b['state'] != 'synced' else 'dim'
+            cells = [paint(b['branch'].ljust(branchw), color) if opts.remote else mark + ' ' + paint(b['branch'].ljust(branchw), color)]
+            if syncw:
+                cells.append(paint(f"{b['sync']:<{syncw}}", '35' if opts.remote else sync_color))
+            if tagw:
+                cells.append(paint(f"{b['tag']:<{tagw}}", BRANCH_TAG_COLORS.get(b['tag'], '')))
+            cells.append(paint(b['oid'][:7], 'dim'))
+            cells.append(f"{b['when']:<{whenw}}")
+            if authorw:
+                cells.append(f"{b['author']:<{authorw}}")
+            cells.append(b['message'])
+            line = '  '.join(cells)
+            if b['worktree']:
+                line += '  ' + paint('+ worktree ' + b['worktree'].replace(home, '~', 1), '36')
+            print(('  ' if opts.remote else ' ') + line.rstrip())
+    if not any(res['branches'] or res['error'] for res in results):
+        print('No other branches.' if not opts.default else 'No branches.')
+
+
+COMMANDS = {'ll': cmd_ll, 'pull': cmd_pull, 'clean': cmd_clean, 'branch': cmd_branch}
 
 
 def main():
