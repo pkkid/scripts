@@ -21,7 +21,8 @@ Commands:
                         --remote deletes merged branches on GitHub instead
   branch [--remote] [--default] [FOLDER...]
                         list each repo's branches (other than main) with
-                        their sync state, merged status and last commit;
+                        their sync state, merged status, lines changed
+                        against main and last commit;
                         --remote fetches and lists the branches on origin
                         with their open PRs; --default includes main too
 
@@ -166,6 +167,16 @@ def make_paint(choice):
     return paint
 
 
+TIME_UNITS = {'second': 's', 'minute': 'm', 'hour': 'h', 'day': 'd', 'week': 'w', 'month': 'mo', 'year': 'y'}
+
+
+def short_ago(text):
+    """ Shorten git's relative dates: '3 days ago' becomes '3d ago' and
+    '1 year, 2 months ago' becomes '1y 2mo ago'. """
+    text = re.sub(r'(\d+) (second|minute|hour|day|week|month|year)s?\b', lambda m: m[1] + TIME_UNITS[m[2]], text.strip())
+    return text.replace(', ', ' ')
+
+
 def repo_info(path):
     """ Gather one repo's status. One `git status` call covers the branch,
     upstream, ahead/behind and the staged, unstaged and untracked files. """
@@ -200,17 +211,22 @@ def repo_info(path):
     when, _, message = git(path, 'log', '-1', '--format=%cr%x00%B').partition('\0')
     message = ' '.join(message.split())
     message = message if len(message) <= 40 else message[:40].rstrip() + '…'
-    r['message'], r['when'] = message, when.strip()
-    r['added'] = r['removed'] = 0
-    if r['dirty']:
-        # Lines added and removed in tracked files, staged or not, against the
-        # last commit. Binary files (shown as "-") are left out.
-        for line in lines(git(path, 'diff', 'HEAD', '--numstat')):
-            added, removed = line.split('\t')[:2]
-            if added.isdigit() and removed.isdigit():
-                r['added'] += int(added)
-                r['removed'] += int(removed)
+    r['message'], r['when'] = message, short_ago(when)
+    # Lines added and removed in tracked files, staged or not, against the
+    # last commit.
+    r['added'], r['removed'] = diff_counts(path, 'HEAD') if r['dirty'] else (0, 0)
     return r
+
+
+def diff_counts(path, *args):
+    """ (added, removed) line totals of `git diff --numstat ARGS`. Binary
+    files (shown as "-") are left out. """
+    added = removed = 0
+    for line in lines(git(path, 'diff', '--numstat', *args)):
+        a, r = line.split('\t')[:2]
+        if a.isdigit() and r.isdigit():
+            added, removed = added + int(a), removed + int(r)
+    return added, removed
 
 
 def sync_state(r):
@@ -260,8 +276,15 @@ def paint_flags(flag, width, paint):
 
 
 def change_text(r):
-    """ Lines added (+) and removed (-) in uncommitted changes. """
+    """ Lines added (+) and removed (-), as in r['added'] and r['removed']. """
     return ' '.join(x for x in (f"+{r['added']}" if r['added'] else '', f"-{r['removed']}" if r['removed'] else '') if x)
+
+
+def change_cell(r, width, paint):
+    """ change_text() with + in green and - in red, padded to width. """
+    added = paint(f"+{r['added']}", '32') if r['added'] else ''
+    removed = paint(f"-{r['removed']}", '31') if r['removed'] else ''
+    return ' '.join(x for x in (added, removed) if x) + ' ' * (width - len(change_text(r)))
 
 
 # Count columns whose zeros are drawn dim (see DIM_STRENGTH), so the
@@ -435,7 +458,7 @@ def remote_info(path, error, default):
     when, _, message = git(path, 'log', '-1', '--format=%cr%x00%B', base).partition('\0')
     message = ' '.join(message.split())
     r['message'] = message if len(message) <= 40 else message[:40].rstrip() + '…'
-    r['when'] = when.strip()
+    r['when'] = short_ago(when)
     return r
 
 
@@ -476,10 +499,10 @@ def ll_remote(repos, opts):
         ('Issues', 'issues', lambda n: n > 0, '36', lambda n: n == 0), # cyan: open issues
     ]
     widths = [max(5, len(h), *(len(str(show(r[k]))) for r in rows)) for h, k, _, _, _ in counts]
-    whenw = max([11] + [len(r['when']) for r in rows])
+    whenw = max([6] + [len(r['when']) for r in rows])
     header = f"{'Repo':<{namew}}  {'Default':<{defaultw}}  "
     header += ' '.join(f'{h:>{w}}' for (h, _, _, _, _), w in zip(counts, widths))
-    header += f"  {'Last Commit':<{whenw}}  Last Commit Msg"
+    header += f"  {'Commit':<{whenw}}  Commit Msg"
     print(paint(header, '1'))
     for name, r in zip(names, rows):
         repo = paint(f'{name:<{namew}}', '1;34' if r['error'] or r['merged'] or r['prs'] else '34')
@@ -542,9 +565,9 @@ def cmd_ll(args):
     show = lambda n: '-' if n is None else n
     header = f"{'Repo':<{namew}}  {'Branch':<{branchw + 1 + flagw}}  {'Sync':<{syncw}}  "
     diffw = max([4] + [len(change_text(r)) for r in rows])
-    whenw = max([11] + [len(r['when']) for r in rows])
+    whenw = max([6] + [len(r['when']) for r in rows])
     header += ' '.join(f'{h:>{w}}' for (h, _, _, _), w in zip(counts, widths))
-    header += f"  {'Diff':<{diffw}}  {'Last Commit':<{whenw}}  Last Commit Msg"
+    header += f"  {'Diff':<{diffw}}  {'Commit':<{whenw}}  Commit Msg"
     print(paint(header, '1'))
     for name, flag, sync, r in zip(names, flags, syncs, rows):
         branch = r['branch'] if len(r['branch']) <= branchw else r['branch'][:branchw - 1] + '…'
@@ -556,10 +579,7 @@ def cmd_ll(args):
         behind = paint(f"↓{r['behind']}", '33') if r['behind'] else ''
         sync_cell = (' '.join(x for x in (ahead, behind) if x) or paint('-', 'dim')) + ' ' * (syncw - len(sync))
         nums = ' '.join(paint(f'{show(r[k]):>{w}}', count_color(k, r[k], hot, code)) for (_, k, hot, code), w in zip(counts, widths))
-        added = paint(f"+{r['added']}", '32') if r['added'] else ''
-        removed = paint(f"-{r['removed']}", '31') if r['removed'] else ''
-        change_cell = ' '.join(x for x in (added, removed) if x) + ' ' * (diffw - len(change_text(r)))
-        print(f"{repo}  {status}  {sync_cell}  {nums}  {change_cell}  {r['when'] or '-':<{whenw}}  {r['message']}".rstrip())
+        print(f"{repo}  {status}  {sync_cell}  {nums}  {change_cell(r, diffw, paint)}  {r['when'] or '-':<{whenw}}  {r['message']}".rstrip())
 
 
 def pull_env(path):
@@ -833,6 +853,7 @@ def plan_clean_remote(path, hub, anyone):
     fmt = '%(refname:lstrip=3)%00%(objectname)%00%(authoremail:trim)%00%(committerdate:relative)'
     for line in lines(git(path, 'for-each-ref', f'--format={fmt}', 'refs/remotes/origin')):
         branch, oid, email, when = line.split('\0')
+        when = short_ago(when)
         if branch == 'HEAD' or branch in protected:
             continue
         if branch in merged:
@@ -990,6 +1011,7 @@ def list_local_branches(path):
     branches = []
     for line in lines(git(path, 'for-each-ref', 'refs/heads', f'--format={fmt}')):
         branch, oid, upstream, track, when, subject = line.split('\0')
+        when = short_ago(when)
         counts = dict(part.split() for part in track.split(', ') if part and part != 'gone')
         ahead, behind = int(counts.get('ahead', 0)), int(counts.get('behind', 0))
         if not upstream:
@@ -1000,8 +1022,16 @@ def list_local_branches(path):
             state = sync_state({'upstream': True, 'ahead': ahead, 'behind': behind})
             sync = ' '.join(x for x in (f'↑{ahead}' if ahead else '', f'↓{behind}' if behind else '') if x) or 'in sync'
         tag = 'default' if branch == default else 'merged' if branch in merged else ''
+        # Lines changed since the branch left the default branch, plus any
+        # uncommitted edits where it is checked out.
+        added = removed = 0
+        mb = git(path, 'merge-base', base, oid).strip() if base else ''
+        if mb:
+            where = checked_out.get(branch) or (path if branch == head else None)
+            added, removed = diff_counts(where, mb) if where else diff_counts(path, mb, oid)
         branches.append({'branch': branch, 'oid': oid, 'current': branch == head, 'state': state, 'sync': sync,
-            'tag': tag, 'when': when, 'message': short_message(subject), 'worktree': checked_out.get(branch)})
+            'tag': tag, 'added': added, 'removed': removed, 'when': when, 'message': short_message(subject),
+            'worktree': checked_out.get(branch)})
     return {'path': path, 'error': None, 'slug': None, 'branches': branches}
 
 
@@ -1030,12 +1060,14 @@ def list_remote_branches(path, hub):
     fmt = '%(refname:lstrip=3)%00%(objectname)%00%(committerdate:relative)%00%(authorname)%00%(contents:subject)'
     for line in lines(git(path, 'for-each-ref', f'--format={fmt}', 'refs/remotes/origin')):
         branch, oid, when, author, subject = line.split('\0')
+        when = short_ago(when)
         if branch == 'HEAD':
             continue
         tag = 'default' if branch == default else 'merged' if branch in merged else ''
         pr = ' '.join(f'#{n}' for n in sorted(prs.get(branch, [])))
+        added, removed = diff_counts(path, f'{base}...{oid}') if base else (0, 0)
         result['branches'].append({'branch': branch, 'oid': oid, 'current': False, 'state': None, 'sync': pr,
-            'tag': tag, 'when': when, 'author': author, 'message': short_message(subject), 'worktree': None})
+            'tag': tag, 'added': added, 'removed': removed, 'when': when, 'author': author, 'message': short_message(subject), 'worktree': None})
     return result
 
 
@@ -1044,8 +1076,9 @@ BRANCH_TAG_COLORS = {'default': '1', 'merged': '32'}
 
 def cmd_branch(args):
     """ List the branches in each repo: how far each is from its upstream,
-    whether it is merged into the default branch, its last commit, and the
-    worktree it is checked out in. With --remote, fetch and list the
+    whether it is merged into the default branch, the lines it adds and
+    removes against the default branch (with uncommitted edits where it is
+    checked out), its last commit, and the worktree it is checked out in. With --remote, fetch and list the
     branches on origin with their open pull requests instead. Merged here
     means a plain merge; `gitr clean -n` also finds squash merges. """
     parser = argparse.ArgumentParser(prog='gitr branch', description=' '.join(cmd_branch.__doc__.split()))
@@ -1084,6 +1117,7 @@ def cmd_branch(args):
         branchw = max(len(b['branch']) for b in rows)
         syncw = max(len(b['sync']) for b in rows)
         tagw = max(len(b['tag']) for b in rows)
+        diffw = max(len(change_text(b)) for b in rows)
         whenw = max(len(b['when']) for b in rows)
         authorw = max([0] + [len(b.get('author', '')) for b in rows])
         for b in rows:
@@ -1095,6 +1129,8 @@ def cmd_branch(args):
                 cells.append(paint(f"{b['sync']:<{syncw}}", '35' if opts.remote else sync_color))
             if tagw:
                 cells.append(paint(f"{b['tag']:<{tagw}}", BRANCH_TAG_COLORS.get(b['tag'], '')))
+            if diffw:
+                cells.append(change_cell(b, diffw, paint))
             cells.append(paint(b['oid'][:7], 'dim'))
             cells.append(f"{b['when']:<{whenw}}")
             if authorw:
